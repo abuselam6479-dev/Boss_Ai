@@ -64,13 +64,19 @@ last_request = {}
 
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_database():
     conn = get_db()
+
+    # WAL mode lets reads and writes happen concurrently instead of
+    # blocking each other, which is what was causing "database is locked"
+    # crashes once several users/background threads hit the DB at once.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
