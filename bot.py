@@ -57,6 +57,8 @@ telebirr_waiting = set()
 memory_waiting = set()
 doc_waiting = set()
 broadcast_waiting = set()
+channel_setup_waiting = set()
+post_channel_waiting = set()
 
 busy_users = set()
 busy_lock = threading.Lock()
@@ -67,6 +69,29 @@ def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def get_setting(key, default=None):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (key,)
+    ).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO settings (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (key, value)
+    )
+    conn.commit()
+    conn.close()
 
 
 def init_database():
@@ -125,6 +150,13 @@ def init_database():
             user_id INTEGER,
             rating TEXT,
             created_at INTEGER
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
         )
     """)
 
@@ -261,6 +293,9 @@ def main_keyboard(user_id=None):
         markup.row(
             KeyboardButton("👑 Admin Panel"),
             KeyboardButton("📢 Broadcast")
+        )
+        markup.row(
+            KeyboardButton("📣 Post to Channel")
         )
 
     return markup
@@ -2603,6 +2638,116 @@ def process_broadcast(message):
     )
 
 
+@bot.message_handler(func=lambda m: m.text == "📣 Post to Channel")
+def post_channel_button(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    current_channel = get_setting("post_channel")
+
+    if not current_channel:
+        channel_setup_waiting.add(message.from_user.id)
+        bot.reply_to(
+            message,
+            "📣 Post to Channel\n\n"
+            "No channel is set up yet. Send the channel's username "
+            "(e.g. @bossainews). Make sure BOSSAI is an admin of that "
+            "channel first."
+        )
+        return
+
+    post_channel_waiting.add(message.from_user.id)
+    bot.reply_to(
+        message,
+        f"📣 Post to Channel\n\n"
+        f"Current channel: {current_channel}\n\n"
+        "Send the message you want posted there now.\n\n"
+        "To switch to a different channel instead, type 'change'."
+    )
+
+
+def process_channel_setup(message):
+    user_id = message.from_user.id
+    channel_setup_waiting.discard(user_id)
+
+    channel_username = (message.text or "").strip()
+
+    if not channel_username.startswith("@"):
+        channel_username = "@" + channel_username
+
+    try:
+        chat = bot.get_chat(channel_username)
+        member = bot.get_chat_member(chat.id, bot.get_me().id)
+
+        if member.status not in ("administrator", "creator"):
+            bot.reply_to(
+                message,
+                f"BOSSAI is not an admin in {channel_username}. "
+                "Please add it as an admin there first, then try again."
+            )
+            return
+
+    except Exception as error:
+        print("Channel setup failed:", error)
+        bot.reply_to(
+            message,
+            f"Could not find or access {channel_username}. Make sure the "
+            "username is correct and BOSSAI is an admin there, then try again."
+        )
+        return
+
+    set_setting("post_channel", channel_username)
+
+    post_channel_waiting.add(user_id)
+    bot.reply_to(
+        message,
+        f"✅ Channel set to {channel_username}.\n\n"
+        "Send the message you want posted there now."
+    )
+
+
+def process_channel_post(message):
+    user_id = message.from_user.id
+
+    text = (message.text or "").strip()
+
+    if text.lower() == "change":
+        post_channel_waiting.discard(user_id)
+        channel_setup_waiting.add(user_id)
+        bot.reply_to(
+            message,
+            "Send the new channel's username (e.g. @mychannel). "
+            "Make sure BOSSAI is an admin of that channel first."
+        )
+        return
+
+    post_channel_waiting.discard(user_id)
+
+    channel_username = get_setting("post_channel")
+
+    if not channel_username:
+        bot.reply_to(
+            message,
+            "No channel is set up. Tap 📣 Post to Channel again to set one up."
+        )
+        return
+
+    if not text:
+        bot.reply_to(message, "Please send a message to post.")
+        return
+
+    try:
+        bot.send_message(channel_username, text)
+        bot.reply_to(message, f"✅ Posted to {channel_username}.")
+    except Exception as error:
+        print("Channel post failed:", error)
+        bot.reply_to(
+            message,
+            f"Could not post to {channel_username}. Make sure BOSSAI is "
+            "still an admin there."
+        )
+
+
 @bot.callback_query_handler(
     func=lambda call: call.data.startswith("adm:")
 )
@@ -2692,6 +2837,20 @@ def chat(message):
         and user_id in broadcast_waiting
     ):
         process_broadcast(message)
+        return
+
+    if (
+        is_admin(user_id)
+        and user_id in channel_setup_waiting
+    ):
+        process_channel_setup(message)
+        return
+
+    if (
+        is_admin(user_id)
+        and user_id in post_channel_waiting
+    ):
+        process_channel_post(message)
         return
 
     if not enforce_channel_join(message, user):
