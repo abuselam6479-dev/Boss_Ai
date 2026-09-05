@@ -2638,6 +2638,37 @@ def process_broadcast(message):
     )
 
 
+pending_channel_post = {}  # admin_id -> draft text currently awaiting confirmation
+channel_adjust_waiting = set()
+
+
+def channel_choice_markup():
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("✍️ እኔ አዘጋጃለሁ", callback_data="chpost:manual"),
+        InlineKeyboardButton("🤖 አንተ አዘጋጅ", callback_data="chpost:ai")
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="chpost:cancel"))
+    return markup
+
+
+def channel_manual_confirm_markup():
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📤 Send", callback_data="chpost:send_manual"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="chpost:cancel"))
+    return markup
+
+
+def channel_ai_confirm_markup():
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("✅ ልጥፈው", callback_data="chpost:send_ai"),
+        InlineKeyboardButton("✏️ አስተካክል", callback_data="chpost:adjust")
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="chpost:cancel"))
+    return markup
+
+
 @bot.message_handler(func=lambda m: m.text == "📣 Post to Channel")
 def post_channel_button(message):
     if not is_admin(message.from_user.id):
@@ -2656,13 +2687,12 @@ def post_channel_button(message):
         )
         return
 
-    post_channel_waiting.add(message.from_user.id)
     bot.reply_to(
         message,
         f"📣 Post to Channel\n\n"
         f"Current channel: {current_channel}\n\n"
-        "Send the message you want posted there now.\n\n"
-        "To switch to a different channel instead, type 'change'."
+        "Who should write the message?",
+        reply_markup=channel_choice_markup()
     )
 
 
@@ -2698,54 +2728,216 @@ def process_channel_setup(message):
 
     set_setting("post_channel", channel_username)
 
-    post_channel_waiting.add(user_id)
     bot.reply_to(
         message,
         f"✅ Channel set to {channel_username}.\n\n"
-        "Send the message you want posted there now."
+        "Who should write the message?",
+        reply_markup=channel_choice_markup()
     )
 
 
 def process_channel_post(message):
+    """Called while post_channel_waiting is set — this is the manual
+    (admin-writes-it) path only. The draft is stored for confirmation,
+    not posted immediately."""
     user_id = message.from_user.id
+    post_channel_waiting.discard(user_id)
 
     text = (message.text or "").strip()
 
-    if text.lower() == "change":
-        post_channel_waiting.discard(user_id)
-        channel_setup_waiting.add(user_id)
-        bot.reply_to(
-            message,
-            "Send the new channel's username (e.g. @mychannel). "
-            "Make sure BOSSAI is an admin of that channel first."
-        )
-        return
-
-    post_channel_waiting.discard(user_id)
-
-    channel_username = get_setting("post_channel")
-
-    if not channel_username:
-        bot.reply_to(
-            message,
-            "No channel is set up. Tap 📣 Post to Channel again to set one up."
-        )
-        return
-
     if not text:
         bot.reply_to(message, "Please send a message to post.")
+        post_channel_waiting.add(user_id)
+        return
+
+    pending_channel_post[user_id] = text
+
+    bot.reply_to(
+        message,
+        "Preview:\n\n" + text,
+        reply_markup=channel_manual_confirm_markup()
+    )
+
+
+def generate_channel_post_draft(feedback=None, previous_draft=None):
+    channel_post_system_prompt = r"""
+You write short, natural, engaging Amharic posts for a Telegram news channel
+that belongs to an AI assistant bot called BOSSAI.
+
+Write like a real person announcing something to their community — warm,
+direct, not corporate, not spammy. Highlight one useful thing about BOSSAI
+(chat, image creation, reading photos/documents, or just a friendly tip),
+or share a short update/greeting. Vary the angle each time.
+
+Do not use markdown symbols such as ** or ##. Keep it short (3-6 sentences).
+Do not add hashtags unless they feel natural. Do not add commentary about
+being an AI. Return only the post content, nothing else.
+""" + "\n\n" + current_time_context()
+
+    if feedback and previous_draft:
+        user_request = (
+            "Here is the previous draft:\n\n" + previous_draft +
+            "\n\nThe admin asked for this change: " + feedback +
+            "\n\nRewrite the post applying that change."
+        )
+    else:
+        user_request = "Write a fresh channel post for BOSSAI now."
+
+    if OPENROUTER_API_KEY:
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": CHAT_MODELS["DeepSeek"],
+                    "max_tokens": 500,
+                    "messages": [
+                        {"role": "system", "content": channel_post_system_prompt},
+                        {"role": "user", "content": user_request}
+                    ]
+                },
+                timeout=60
+            )
+
+            if response.ok:
+                return response.json()["choices"][0]["message"]["content"]
+
+        except Exception as error:
+            print("Channel post draft via OpenRouter failed:", error)
+
+    if GEMINI_API_KEY:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+
+        response = call_gemini_with_retry(
+            client,
+            model="gemini-3.6-flash",
+            contents=channel_post_system_prompt + "\n\n" + user_request
+        )
+
+        if response.text:
+            return response.text
+
+    raise RuntimeError("No AI service is available to write the post right now.")
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("chpost:")
+)
+def channel_post_callback(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Not authorized.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id)
+    user_id = call.from_user.id
+    action = call.data.split(":", 1)[1]
+
+    if action == "cancel":
+        pending_channel_post.pop(user_id, None)
+        post_channel_waiting.discard(user_id)
+        channel_adjust_waiting.discard(user_id)
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id, call.message.message_id, reply_markup=None
+            )
+        except Exception:
+            pass
+        bot.send_message(call.message.chat.id, "Cancelled.")
+        return
+
+    if action == "manual":
+        post_channel_waiting.add(user_id)
+        bot.send_message(call.message.chat.id, "Send the message you want posted.")
+        return
+
+    if action == "ai":
+        try:
+            draft = generate_channel_post_draft()
+        except Exception as error:
+            print("Channel draft generation failed:", error)
+            bot.send_message(
+                call.message.chat.id,
+                "Sorry, the service is temporarily unavailable. Please try again shortly."
+            )
+            return
+
+        pending_channel_post[user_id] = draft
+        bot.send_message(
+            call.message.chat.id,
+            "Draft:\n\n" + draft,
+            reply_markup=channel_ai_confirm_markup()
+        )
+        return
+
+    if action == "adjust":
+        channel_adjust_waiting.add(user_id)
+        bot.send_message(
+            call.message.chat.id,
+            "What should be changed?"
+        )
+        return
+
+    if action in ("send_manual", "send_ai"):
+        channel_username = get_setting("post_channel")
+        draft = pending_channel_post.pop(user_id, None)
+
+        if not draft:
+            bot.send_message(call.message.chat.id, "Nothing to post — please start again.")
+            return
+
+        if not channel_username:
+            bot.send_message(
+                call.message.chat.id,
+                "No channel is set up. Tap 📣 Post to Channel again to set one up."
+            )
+            return
+
+        try:
+            bot.send_message(channel_username, draft)
+            bot.send_message(call.message.chat.id, f"✅ Posted to {channel_username}.")
+        except Exception as error:
+            print("Channel post failed:", error)
+            bot.send_message(
+                call.message.chat.id,
+                f"Could not post to {channel_username}. Make sure BOSSAI is "
+                "still an admin there."
+            )
+        return
+
+
+def process_channel_adjust(message):
+    user_id = message.from_user.id
+    channel_adjust_waiting.discard(user_id)
+
+    feedback = (message.text or "").strip()
+    previous_draft = pending_channel_post.get(user_id)
+
+    if not feedback or not previous_draft:
+        bot.reply_to(message, "Please try 📣 Post to Channel again.")
         return
 
     try:
-        bot.send_message(channel_username, text)
-        bot.reply_to(message, f"✅ Posted to {channel_username}.")
+        new_draft = generate_channel_post_draft(
+            feedback=feedback,
+            previous_draft=previous_draft
+        )
     except Exception as error:
-        print("Channel post failed:", error)
+        print("Channel draft adjustment failed:", error)
         bot.reply_to(
             message,
-            f"Could not post to {channel_username}. Make sure BOSSAI is "
-            "still an admin there."
+            "Sorry, the service is temporarily unavailable. Please try again shortly."
         )
+        return
+
+    pending_channel_post[user_id] = new_draft
+    bot.reply_to(
+        message,
+        "Updated draft:\n\n" + new_draft,
+        reply_markup=channel_ai_confirm_markup()
+    )
 
 
 @bot.callback_query_handler(
@@ -2851,6 +3043,13 @@ def chat(message):
         and user_id in post_channel_waiting
     ):
         process_channel_post(message)
+        return
+
+    if (
+        is_admin(user_id)
+        and user_id in channel_adjust_waiting
+    ):
+        process_channel_adjust(message)
         return
 
     if not enforce_channel_join(message, user):
