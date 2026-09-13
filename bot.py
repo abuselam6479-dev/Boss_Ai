@@ -645,9 +645,13 @@ def ask_ai(user_id, text):
             print(f"{model_name} failed; trying next model:", error)
             continue
 
-    # Never expose provider/API errors to users. The admin notification layer
-    # receives the real exception from the caller.
-    raise RuntimeError("All AI providers are temporarily unavailable.")
+    # The user-facing message stays generic, but the admin notification
+    # should show exactly why each provider failed — otherwise a
+    # persistent outage is impossible to diagnose from Telegram.
+    raise RuntimeError(
+        "All AI providers are temporarily unavailable. Details: "
+        + " | ".join(errors)
+    )
 
 
 def notify_admin_error(context, user_id, error):
