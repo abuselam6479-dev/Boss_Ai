@@ -23,8 +23,10 @@ from telebot.types import (
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "").strip()
 ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "0").strip()
-
 try:
     ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW else 0
 except ValueError:
@@ -613,9 +615,7 @@ def ask_openrouter_model(user_id, text, model_name):
     )
 
     if not response.ok:
-        raise RuntimeError(
-            f"OpenRouter {model_name} {response.status_code}: {response.text[:300]}"
-        )
+        raise RuntimeError(f"OpenRouter {model_name} {response.status_code}: {response.text[:300]}")
 
     data = response.json()
     content = data["choices"][0]["message"].get("content", "")
@@ -624,11 +624,84 @@ def ask_openrouter_model(user_id, text, model_name):
     return content
 
 
+def ask_openai_compatible(user_id, text, base_url, api_key, model_name):
+    if not api_key:
+        raise RuntimeError(f"{model_name} API key is missing.")
+
+    history = get_history(user_id)
+    messages = [{"role": "system", "content": system_prompt()}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": text})
+
+    response = requests.post(
+        base_url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": model_name,
+            "messages": messages,
+            "max_tokens": 1200
+        },
+        timeout=90
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"{model_name} {response.status_code}: {response.text[:300]}")
+
+    data = response.json()
+    content = data["choices"][0]["message"].get("content", "")
+    if not content:
+        raise RuntimeError(f"{model_name} returned an empty response.")
+    return content
+
+
+def ask_groq(user_id, text):
+    return ask_openai_compatible(
+        user_id, text,
+        "https://api.groq.com/openai/v1/chat/completions",
+        GROQ_API_KEY,
+        "llama-3.3-70b-versatile"
+    )
+
+
+def ask_github_models(user_id, text):
+    return ask_openai_compatible(
+        user_id, text,
+        "https://models.github.ai/inference/chat/completions",
+        GITHUB_TOKEN,
+        "openai/gpt-4o"
+    )
+
+
+def ask_cerebras(user_id, text):
+    return ask_openai_compatible(
+        user_id, text,
+        "https://api.cerebras.ai/v1/chat/completions",
+        CEREBRAS_API_KEY,
+        "llama3.3-70b"
+    )
+
+
+def ask_openrouter_free(user_id, text):
+    return ask_openai_compatible(
+        user_id, text,
+        "https://openrouter.ai/api/v1/chat/completions",
+        OPENROUTER_API_KEY,
+        "openrouter/free"
+    )
+
+
 def ask_ai(user_id, text):
-    # Gemini is always the primary model. We intentionally do not save a
-    # fallback choice, so the next request tries Gemini again automatically.
-    # If Gemini is unavailable/quota-limited, continue silently through the chain.
-    fallback_chain = ["Gemini", "Claude", "Grok", "DeepSeek", "GPT-4o"]
+    # Try providers in order of quality/reliability. Free, independent
+    # providers (Groq, GitHub Models, Cerebras, OpenRouter's free router)
+    # sit between Gemini and the paid OpenRouter models so a Gemini outage
+    # doesn't take the whole bot down.
+    fallback_chain = [
+        "Gemini", "Groq", "GitHub Models", "Cerebras", "OpenRouterFree",
+        "Claude", "Grok", "DeepSeek", "GPT-4o"
+    ]
     errors = []
 
     for model_name in fallback_chain:
@@ -638,6 +711,18 @@ def ask_ai(user_id, text):
                     raise RuntimeError("GEMINI_API_KEY is missing.")
                 return ask_gemini(user_id, text)
 
+            if model_name == "Groq":
+                return ask_groq(user_id, text)
+
+            if model_name == "GitHub Models":
+                return ask_github_models(user_id, text)
+
+            if model_name == "Cerebras":
+                return ask_cerebras(user_id, text)
+
+            if model_name == "OpenRouterFree":
+                return ask_openrouter_free(user_id, text)
+
             return ask_openrouter_model(user_id, text, model_name)
 
         except Exception as error:
@@ -645,9 +730,6 @@ def ask_ai(user_id, text):
             print(f"{model_name} failed; trying next model:", error)
             continue
 
-    # The user-facing message stays generic, but the admin notification
-    # should show exactly why each provider failed — otherwise a
-    # persistent outage is impossible to diagnose from Telegram.
     raise RuntimeError(
         "All AI providers are temporarily unavailable. Details: "
         + " | ".join(errors)
