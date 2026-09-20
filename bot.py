@@ -34,7 +34,7 @@ except ValueError:
 
 FREE_LIMIT = 15
 MONTHLY_PRICE = 100
-DB_FILE = "bossai.db"
+DB_FILE = "/data/bossai.db"
 
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 
@@ -124,6 +124,8 @@ def set_setting(key, value):
 
 
 def init_database():
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+
     conn = get_db()
 
     # WAL mode lets reads and writes happen concurrently instead of
@@ -419,10 +421,17 @@ def system_prompt(notes="", doc_context=""):
     base = r"""
 You are BOSSAI, a high-quality all-in-one AI assistant.
 
-LANGUAGE:
-Reply in the same language the user uses unless they explicitly request another
-language. If the user writes Amharic, the answer MUST be in natural, fluent,
-high-quality Amharic.
+LANGUAGE — STRICT RULE, CHECK THIS FIRST ON EVERY MESSAGE:
+You are fully multilingual and support every world language equally — not
+just Amharic and English. On each new message, detect the language of ONLY
+the user's most recent message (ignore what language earlier messages in
+this conversation were in) and reply in that same language. Never default
+to Amharic, English, or any single language just because it appeared earlier
+in the conversation or because these instructions happen to discuss Amharic
+quality in detail below — that section only applies specifically WHEN the
+detected language is Amharic. If the user explicitly asks for a different
+language than the one they wrote in, use the language they asked for. Treat
+this language check as independent and mandatory for every single reply.
 
 AMHARIC QUALITY — CRITICAL:
 Your Amharic must sound like it was written by a highly educated native Amharic
@@ -635,6 +644,44 @@ def ask_gemini(user_id, text):
     return response.text
 
 
+def ask_gemini_lite(user_id, text):
+    """Gemini 3.5 Flash-Lite has a much higher free daily quota than
+    3.6 Flash and is still in the Gemini family (better Amharic than
+    Groq/Cerebras), so it's tried before falling to non-Gemini models.
+    It does not share the 3.6 Flash cooldown — it has its own quota."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing.")
+
+    user = get_user(user_id)
+    history = get_history(user_id)
+    doc_context = active_documents.get(user_id, "")
+
+    conversation = ""
+    for item in history:
+        conversation += item["role"] + ": " + item["content"] + "\n"
+
+    prompt = (
+        system_prompt(user["notes"] or "", doc_context)
+        + "\n\nPrevious conversation:\n"
+        + conversation
+        + "\n\nCurrent user message:\n"
+        + text
+    )
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
+    response = client.models.generate_content(
+        model="gemini-3.5-flash-lite",
+        contents=prompt,
+        config=types.GenerateContentConfig(max_output_tokens=8192)
+    )
+
+    if not response.text:
+        raise RuntimeError("Gemini Flash-Lite returned an empty response.")
+
+    return response.text
+
+
 def ask_openrouter_model(user_id, text, model_name):
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is missing.")
@@ -738,15 +785,13 @@ def ask_openrouter_free(user_id, text):
 
 
 def ask_ai(user_id, text):
-    # Try providers in order of quality/reliability. Gemini gives the best
-    # multilingual (especially Amharic) quality, so it's always first when
-    # its quota isn't cooling down. After that, GPT-4o/Claude/DeepSeek/Grok
-    # are strong general-purpose models with decent multilingual quality —
-    # they go before the weaker free Llama-based providers (Groq, GitHub
-    # Models, Cerebras, OpenRouter's free router), which are a last resort.
+    # Best Amharic/multilingual quality first (Gemini family), then a
+    # real GPT-4o via GitHub Models, then the weaker-but-free Llama
+    # providers. The paid OpenRouter models are left out of the active
+    # chain — without credit they always fail instantly and only add
+    # latency and error noise.
     fallback_chain = [
-        "Gemini", "GPT-4o", "Claude", "DeepSeek", "Grok",
-        "Groq", "GitHub Models", "Cerebras", "OpenRouterFree"
+        "Gemini", "Gemini-Lite", "GitHub Models", "Groq", "Cerebras", "OpenRouterFree"
     ]
     errors = []
 
@@ -756,6 +801,9 @@ def ask_ai(user_id, text):
                 if not GEMINI_API_KEY:
                     raise RuntimeError("GEMINI_API_KEY is missing.")
                 return ask_gemini(user_id, text)
+
+            if model_name == "Gemini-Lite":
+                return ask_gemini_lite(user_id, text)
 
             if model_name == "Groq":
                 return ask_groq(user_id, text)
@@ -768,8 +816,6 @@ def ask_ai(user_id, text):
 
             if model_name == "OpenRouterFree":
                 return ask_openrouter_free(user_id, text)
-
-            return ask_openrouter_model(user_id, text, model_name)
 
         except Exception as error:
             errors.append(f"{model_name}: {str(error)[:350]}")
@@ -792,7 +838,7 @@ def notify_admin_error(context, user_id, error):
             "⚠️ BOSSAI Error\n\n"
             f"Context: {context}\n"
             f"User ID: {user_id}\n"
-            f"Error: {str(error)[:400]}"
+            f"Error: {str(error)[:1500]}"
         )
     except Exception as notify_error:
         print("Could not notify admin:", notify_error)
@@ -830,6 +876,9 @@ def send_long_message(message, text, feedback_markup=None):
         text = "Sorry, I could not generate a response."
 
     text = clean_formatting(text)
+
+    if not text.strip():
+        text = "Sorry, I could not generate a response."
 
     chunks = [
         text[i:i + 4000]
@@ -2509,6 +2558,13 @@ def admin_panel_markup():
         )
     )
 
+    markup.add(
+        InlineKeyboardButton(
+            "👥 Active Subscribers",
+            callback_data="adm:subscribers"
+        )
+    )
+
     markup.row(
         InlineKeyboardButton(
             "⏳ Pending",
@@ -2611,6 +2667,51 @@ def build_admin_stats():
         f"❌ Rejected payments: {rejected}\n"
         f"💰 Approved revenue: {revenue} ETB"
     )
+
+
+def build_active_subscribers_list(limit=50):
+    now = int(time.time())
+
+    conn = get_db()
+
+    rows = conn.execute(
+        """
+        SELECT user_id, first_name, username, subscription_until
+        FROM users
+        WHERE subscription_until > ?
+        ORDER BY subscription_until ASC
+        LIMIT ?
+        """,
+        (now, limit)
+    ).fetchall()
+
+    conn.close()
+
+    if not rows:
+        return "👥 Active Subscribers\n\nNo active subscribers right now."
+
+    text = f"👥 Active Subscribers ({len(rows)})\n\n"
+
+    for row in rows:
+        name = row["first_name"] or "Unknown"
+
+        username = (
+            f"@{row['username']}"
+            if row["username"]
+            else "no username"
+        )
+
+        days_left = max(
+            0,
+            int((row["subscription_until"] - now) / 86400)
+        )
+
+        text += (
+            f"• {name} ({username})\n"
+            f"  ID: {row['user_id']} | {days_left} days left\n\n"
+        )
+
+    return text
 
 
 def build_payment_list(status, limit=15):
@@ -3149,6 +3250,9 @@ def admin_panel_callback(call):
     if action == "stats":
         text = build_admin_stats()
 
+    elif action == "subscribers":
+        text = build_active_subscribers_list()
+
     elif action == "pending":
         text = build_payment_list("pending")
 
@@ -3470,7 +3574,14 @@ def startup_diagnostic():
         + "\n"
         + status_line("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
         + "\n"
+        + status_line("GROQ_API_KEY", GROQ_API_KEY)
+        + "\n"
+        + status_line("GITHUB_TOKEN", GITHUB_TOKEN)
+        + "\n"
+        + status_line("CEREBRAS_API_KEY", CEREBRAS_API_KEY)
+        + "\n"
         + f"ADMIN_ID: {ADMIN_ID}\n"
+        + f"DB_FILE: {DB_FILE}\n"
         + "Admin Panel: ENABLED"
     )
 
